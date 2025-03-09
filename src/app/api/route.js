@@ -1,64 +1,71 @@
 import { NextResponse } from "next/server";
-import multer from "multer";
-import { createReadStream, promises as fs } from "fs";
-import path from "path";
+import formidable from "formidable";
+import { promises as fs } from "fs";
 import unzipper from "unzipper";
-import csvParser from "csv-parser";
-import { promisify } from "util";
+import csv from "csv-parser";
+import OpenAI from "openai";
 
-const upload = multer({ dest: "/tmp/uploads" });
-const runMiddleware = promisify(upload.single("file"));
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 export async function POST(req) {
-  try {
-    // Parse multipart form data
-    const formData = await req.formData();
-    const file = formData.get("file");
+  const form = formidable({ multiples: true });
 
-    if (!file) {
-      return NextResponse.json({ error: "File is required" }, { status: 400 });
-    }
+  return new Promise((resolve, reject) => {
+    form.parse(req, async (err, fields, files) => {
+      if (err) return reject(NextResponse.json({ error: "File upload failed" }, { status: 500 }));
 
-    // Read file buffer
-    const fileBuffer = Buffer.from(await file.arrayBuffer());
-    const zipPath = path.join("/tmp/uploads", file.name);
-    await fs.writeFile(zipPath, fileBuffer);
+      const question = fields.question[0];
+      let answer = "";
 
-    const extractPath = path.join("/tmp/uploads", "extracted");
-    await fs.mkdir(extractPath, { recursive: true });
+      if (files.file) {
+        // Extract ZIP and read CSV
+        const filePath = files.file[0].filepath;
+        const extractedFiles = await extractZip(filePath);
+        const csvFile = extractedFiles.find((f) => f.endsWith(".csv"));
 
-    // Unzip the file
-    await fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: extractPath })).promise();
+        if (csvFile) {
+          answer = await readCSV(csvFile);
+        }
+      } else {
+        // Use OpenAI to answer
+        const response = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: [{ role: "system", content: "Answer questions from TDS assignments." }, { role: "user", content: question }],
+        });
+        answer = response.choices[0].message.content;
+      }
 
-    // Find the extracted CSV file
-    const files = await fs.readdir(extractPath);
-    const csvFile = files.find((f) => f.endsWith(".csv"));
-
-    if (!csvFile) {
-      return NextResponse.json({ error: "No CSV file found in zip" }, { status: 400 });
-    }
-
-    const csvPath = path.join(extractPath, csvFile);
-
-    // Read the CSV file
-    let answer = null;
-    await new Promise((resolve, reject) => {
-      createReadStream(csvPath)
-        .pipe(csvParser())
-        .on("data", (row) => {
-          if (row.answer) answer = row.answer;
-        })
-        .on("end", resolve)
-        .on("error", reject);
+      resolve(NextResponse.json({ answer }));
     });
+  });
+}
 
-    if (!answer) {
-      return NextResponse.json({ error: "No 'answer' column found in CSV" }, { status: 400 });
-    }
+async function extractZip(zipPath) {
+  const extractedFiles = [];
+  await fs.createReadStream(zipPath)
+    .pipe(unzipper.Parse())
+    .on("entry", async (entry) => {
+      const fileName = entry.path;
+      if (fileName.endsWith(".csv")) {
+        const outputPath = `/tmp/${fileName}`;
+        extractedFiles.push(outputPath);
+        entry.pipe(fs.createWriteStream(outputPath));
+      } else {
+        entry.autodrain();
+      }
+    })
+    .promise();
+  return extractedFiles;
+}
 
-    return NextResponse.json({ answer });
-  } catch (error) {
-    console.error(error);
-    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
-  }
+async function readCSV(csvPath) {
+  return new Promise((resolve) => {
+    let result = "";
+    fs.createReadStream(csvPath)
+      .pipe(csv())
+      .on("data", (row) => {
+        if (row.answer) result = row.answer;
+      })
+      .on("end", () => resolve(result));
+  });
 }
